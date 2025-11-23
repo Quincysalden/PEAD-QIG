@@ -34,6 +34,45 @@ dataframes = []
 
 tickers = list(tickers)
 
+def create_earnings_windows(price_data, earnings_data, tickers):
+    earnings_windows = defaultdict(list)
+    
+    for num , ticker in enumerate(tickers):
+        print(f"processing pt1 ticker {num}/{len(tickers)}")
+        price_df = price_data[price_data['ticker'] == ticker].copy()
+        earnings_df = earnings_data[earnings_data['ticker'] == ticker].copy()
+        price_df['date'] = pd.to_datetime(price_df['date']).dt.tz_localize(None).dt.date
+        earnings_df['date'] = pd.to_datetime(earnings_df['date']).dt.date
+        earnings_df['Earnings'] = 1
+    
+        
+    
+        if len(earnings_df) > 20:
+            combined_df = price_df.reset_index(drop=True)
+            combined_df['Earnings'] = 0  # initialize column to avoid missing entries
+    
+            for _, earn_row in earnings_df.iterrows():
+                earn_date = earn_row['date']
+                combined_df.loc[combined_df['date'] == earn_date, 'Earnings'] = 1
+    
+            
+    
+            combined_df['daily return'] = combined_df['close'].pct_change()
+            combined_df['2day interval'] = np.where(combined_df['Earnings'] == 1, (1+combined_df['daily return'].shift(-1)) * (1 + combined_df['daily return']) - 1 , 0)
+    
+            earnings_dates = combined_df.loc[combined_df['Earnings'] == 1, 'date'].tolist()
+            
+            for earn_date in earnings_dates:
+                # Get the index of the earnings date
+                idx = combined_df.index[combined_df['date'] == earn_date][0]
+               
+                # Slice the window (earn_date + next 30 trading days)
+                window_df = combined_df.iloc[idx: idx + 2 + window_days].copy()
+                earnings_windows[ticker].append(window_df)
+                
+           # data[ticker] = combined_df
+           
+    return earnings_windows
 
 def flatten_all_results(all_results, max_weeks=6):
     """
