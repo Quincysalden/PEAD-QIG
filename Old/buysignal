@@ -1,0 +1,857 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+
+price_data = pd.read_csv('SP500_price_data_combined.csv')
+earnings_data = pd.read_excel('SP500_data.xlsx')
+price_data['Date'] = pd.to_datetime(price_data['Date'])
+earnings_data['Date'] = pd.to_datetime(earnings_data['Date'])
+
+earnings_data.columns = ['ticker', 'epsActual', 'epsEstimated', 'date']
+price_data.columns = ['date', 'close', 'ticker']
+
+spy_close = pd.read_excel("spy_close 2000_2025_11_1.xlsx")
+spy_close['Date'] = pd.to_datetime(spy_close['Date'])
+spy_close = spy_close.sort_values('Date').reset_index(drop=True)
+spy_close['spy_return'] = spy_close['Close'].pct_change()
+
+price_data_new = pd.read_csv('SP500_price_new.csv')
+price_data_new['date'] = pd.to_datetime(price_data_new['date'])
+price_data_new['ticker'] = price_data_new['TICKER']
+price_data_new['close'] = price_data_new['PRC']
+price_data_new = price_data_new[['date', 'ticker', 'close']]
+
+earnings_data_new = pd.read_csv('quarterly_earnings_dates.csv')
+earnings_data_new['date'] = pd.to_datetime(earnings_data_new['EarningsDateTime'])
+earnings_data_new = earnings_data_new[earnings_data_new['date'] <= '2024-12-31']
+earnings_data_new['ticker'] = earnings_data_new['Ticker'].apply(lambda tick: tick.split('.')[0])
+earnings_data_new = earnings_data_new[['ticker', 'date']]
+
+bad_tickers = [
+    'BR', 'CE', 'CEG', 'CF', 'CNC', 'DAL', 'DD', 'DELL', 'DG', 'DOW', 'DYN', 'FLR',
+    'GAP', 'GM', 'GTX', 'H', 'HCA', 'HLT', 'KMI', 'MIR', 'MNST', 'Q', 'S', 'SMCI',
+    'T', 'TAP', 'TT', 'VC', 'WM'
+]
+
+earnings_data = earnings_data_new[~earnings_data_new['ticker'].isin(bad_tickers)].copy()
+
+constituents = pd.read_csv('sp500_members_by_year_2000_2024.csv')
+earnings_data['year'] = earnings_data['date'].dt.year
+filtered_earnings = earnings_data.merge(
+    constituents[['ticker', 'year']],
+    on=['ticker', 'year'],
+    how='inner'
+).drop(columns=['year'])
+
+earnings_data = filtered_earnings.copy()
+price_data = price_data_new.copy()
+
+earnings_tickers = set(tick.split('.')[0] for tick in earnings_data['ticker'])
+tickers = sorted(list(set(price_data['ticker']) & earnings_tickers))
+print(f'{len(tickers)} tickers used in simulation')
+
+filtered_earnings['date'] = pd.to_datetime(filtered_earnings['date'])
+filtered_earnings['year_quarter'] = filtered_earnings['date'].dt.to_period('Q')
+quarter_counts = filtered_earnings.groupby('year_quarter').size()
+
+plt.figure(figsize=(14, 6))
+quarter_counts.plot(kind='line', marker='o')
+plt.title('Number of Earnings Announcements per Quarter')
+plt.xlabel('Quarter')
+plt.ylabel('Number of Announcements')
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+quarter_percent = (quarter_counts / 500) * 100
+
+plt.figure(figsize=(14, 6))
+quarter_percent.plot(kind='line', marker='o', color='green')
+plt.title('Earnings Announcements per Quarter (% of 500)')
+plt.xlabel('Quarter')
+plt.ylabel('Percentage of 500')
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+def create_earnings_windows(
+    price_data,
+    earnings_data,
+    tickers,
+    window_days=30,
+    pre_event_days=60
+):
+    earnings_windows = defaultdict(list)
+
+    for num, ticker in enumerate(tickers):
+        if num % 50 == 0:
+            print(f"processing pt1 ticker {num}/{len(tickers)}")
+
+        price_df = price_data[price_data['ticker'] == ticker].copy()
+        earnings_df = earnings_data[earnings_data['ticker'] == ticker].copy()
+
+        price_df['date'] = pd.to_datetime(price_df['date']).dt.tz_localize(None).dt.date
+        earnings_df['date'] = pd.to_datetime(earnings_df['date']).dt.date
+        earnings_df['Earnings'] = 1
+
+        if len(earnings_df) > 20:
+            combined_df = price_df.sort_values('date').reset_index(drop=True)
+            combined_df['Earnings'] = 0
+
+            for _, earn_row in earnings_df.iterrows():
+                earn_date = earn_row['date']
+                combined_df.loc[combined_df['date'] == earn_date, 'Earnings'] = 1
+
+            combined_df['daily return'] = combined_df['close'].pct_change()
+
+            combined_df['2day interval'] = np.where(
+                combined_df['Earnings'] == 1,
+                (1 + combined_df['daily return'].shift(-1)) * (1 + combined_df['daily return']) - 1,
+                0
+            )
+
+            earnings_dates = combined_df.loc[combined_df['Earnings'] == 1, 'date'].tolist()
+
+            for earn_date in earnings_dates:
+                idx = combined_df.index[combined_df['date'] == earn_date][0]
+
+                start_idx = max(0, idx - pre_event_days)
+                end_idx = idx + 2 + window_days
+                window_df = combined_df.iloc[start_idx:end_idx].copy()
+
+                earnings_windows[ticker].append(window_df)
+
+    return earnings_windows
+
+def compute_weekly_abnormal(
+    window_df,
+    spy_df,
+    lookback_vol_days=60,
+    start_skip=2,
+    week_days=5,
+    num_weeks=6,
+    min_pre_event_obs=15
+):
+    window_df = window_df.copy()
+    window_df['date'] = pd.to_datetime(window_df['date'])
+    spy_df = spy_df.copy()
+    spy_df['Date'] = pd.to_datetime(spy_df['Date'])
+
+    merged = window_df.merge(
+        spy_df[['Date', 'spy_return']],
+        left_on='date',
+        right_on='Date',
+        how='left'
+    ).drop(columns=['Date'])
+
+    merged['AR'] = merged['daily return'] - merged['spy_return']
+
+    event_locs = merged.index[merged['Earnings'] == 1].tolist()
+    if not event_locs:
+        return pd.DataFrame(columns=['week', 'AR_weekly']), np.nan, np.nan, np.nan, pd.DataFrame(), np.nan
+
+    event_loc = event_locs[0]
+    earn_date = merged.loc[event_loc, 'date']
+    year = earn_date.year
+    quarter = earn_date.to_period('Q')
+
+    pre_event_slice = merged.iloc[max(0, event_loc - lookback_vol_days):event_loc].copy()
+    pre_event_returns = pre_event_slice['daily return'].dropna()
+
+    if len(pre_event_returns) >= min_pre_event_obs:
+        pre_event_vol = pre_event_returns.std(ddof=1)
+    else:
+        pre_event_vol = np.nan
+
+    event_and_after = merged.iloc[event_loc:].copy()
+    first_2day = event_and_after['2day interval'].iloc[0]
+
+    post_event = event_and_after.iloc[start_skip:].copy()
+
+    if post_event.empty:
+        weekly_cum_results = pd.DataFrame(columns=['week', 'AR_weekly'])
+        return weekly_cum_results, first_2day, quarter, year, merged, pre_event_vol
+
+    n_days = len(post_event)
+    week_numbers = np.repeat(np.arange(1, num_weeks + 1), week_days)[:n_days]
+    post_event['week'] = week_numbers
+
+    weekly_cum = post_event.groupby('week').agg({
+        'daily return': lambda x: (1 + x).prod() - 1,
+        'spy_return': lambda x: (1 + x).prod() - 1,
+        'AR': lambda x: (1 + x).prod() - 1
+    }).reset_index()
+
+    weekly_cum.rename(columns={
+        'daily return': 'stock_cum_return',
+        'spy_return': 'spy_cum_return',
+        'AR': 'abnormal_cum_return'
+    }, inplace=True)
+
+    weekly_cum['AR_weekly'] = weekly_cum['stock_cum_return'] - weekly_cum['spy_cum_return']
+    weekly_cum_results = weekly_cum[['week', 'AR_weekly']]
+
+    return weekly_cum_results, first_2day, quarter, year, merged, pre_event_vol
+
+
+def group_results(
+    earnings_windows,
+    tickers,
+    spy_close,
+    lookback_vol_days=60
+):
+    
+    all_results = defaultdict(list)
+
+    for num, ticker in enumerate(tickers):
+        print(f'processing pt2 ticker {num + 1}/{len(tickers)}')
+
+        for window_df in earnings_windows[ticker]:
+            event_locs = window_df.index[window_df['Earnings'] == 1].tolist()
+            if not event_locs:
+                continue
+
+            earn_date = pd.to_datetime(window_df.loc[event_locs[0], 'date'])
+
+            weekly_cum, first_2day, quarter, year, merged, pre_event_vol = compute_weekly_abnormal(
+                window_df=window_df,
+                spy_df=spy_close,
+                lookback_vol_days=lookback_vol_days
+            )
+
+            all_results[ticker].append({
+                'earn_date': earn_date,
+                'weekly_AR': weekly_cum,
+                'first_2day': first_2day,
+                'pre_event_vol': pre_event_vol,
+                'quarter': quarter,
+                'year': year
+            })
+
+    return all_results
+
+
+def flatten_all_results(all_results, max_weeks=6):
+    
+    records = []
+
+    for ticker, events in all_results.items():
+        for e in events:
+            weekly_ar = e['weekly_AR']['AR_weekly'].tolist() if not e['weekly_AR'].empty else []
+            weekly_ar = (weekly_ar + [np.nan] * max_weeks)[:max_weeks]
+
+            records.append({
+                'ticker': ticker,
+                'earn_date': e.get('earn_date'),
+                'first_2day': e.get('first_2day'),
+                'pre_event_vol': e.get('pre_event_vol'),
+                'quarter': e.get('quarter'),
+                'year': e.get('year'),
+                **{f'week{i + 1}': weekly_ar[i] for i in range(max_weeks)}
+            })
+
+    df = pd.DataFrame(records)
+    week_cols = [f'week{i + 1}' for i in range(max_weeks)]
+    df['total_AR'] = df[week_cols].sum(axis=1, skipna=True)
+
+    return df
+
+
+
+def extract_signal_features_df(all_results):
+    records = []
+
+    for ticker, events in all_results.items():
+        for e in events:
+            records.append({
+                'ticker': ticker,
+                'earn_date': e.get('earn_date'),
+                'first_2day': e.get('first_2day'),
+                'pre_event_vol': e.get('pre_event_vol'),
+                'quarter': e.get('quarter'),
+                'year': e.get('year')
+            })
+
+    df = pd.DataFrame(records)
+    df['earn_date'] = pd.to_datetime(df['earn_date'])
+
+    return df.sort_values(['ticker', 'earn_date']).reset_index(drop=True)
+
+
+# --- UPDATED FUNCTION 1 ---
+def add_next_trading_day(event_df, price_data, event_date_col='earn_date', trade_delay=2):
+    """
+    Maps an event date to a future trading date based on actual market calendars.
+    trade_delay=2 means if earnings are on Day T, we buy on Day T+2.
+    """
+    price_dates = price_data[['ticker', 'date']].drop_duplicates().copy()
+    price_dates['date'] = pd.to_datetime(price_dates['date'])
+    price_dates = price_dates.sort_values(['ticker', 'date']).reset_index(drop=True)
+
+    event_df = event_df.copy()
+    event_df[event_date_col] = pd.to_datetime(event_df[event_date_col])
+    event_df = event_df.sort_values(['ticker', event_date_col]).reset_index(drop=True)
+
+    output_frames = []
+
+    for ticker, g in event_df.groupby('ticker', sort=False):
+        ticker_dates = price_dates.loc[price_dates['ticker'] == ticker, 'date'].sort_values().to_numpy()
+        g = g.copy()
+
+        next_dates = []
+        for earn_date in g[event_date_col].to_numpy():
+            idx = np.searchsorted(ticker_dates, np.datetime64(earn_date), side='left')
+            exec_idx = idx + trade_delay
+            
+            if exec_idx < len(ticker_dates):
+                next_dates.append(pd.Timestamp(ticker_dates[exec_idx]))
+            else:
+                next_dates.append(pd.NaT) 
+
+        g['buy_date'] = next_dates
+        output_frames.append(g)
+
+    return pd.concat(output_frames, ignore_index=True)
+
+
+# --- UPDATED FUNCTION 2 ---
+def add_quiet_spike_buy_signals_to_prices(
+    price_data,
+    flat_results,
+    vol_lookback_days=60,
+    low_vol_threshold=0.8,
+    spike_threshold=2.0,
+    min_history_events=8
+):
+    """
+    Generate the quiet-then-spike PEAD signal using vectorized historical medians.
+    """
+    print("Generating Quiet-Spike Signals...")
+    
+    df = flat_results.copy()
+    df = df[['ticker', 'earn_date', 'first_2day', 'pre_event_vol']].copy()
+    df['earn_date'] = pd.to_datetime(df['earn_date'])
+    
+    df = df.sort_values(['ticker', 'earn_date']).reset_index(drop=True)
+
+    df = df[df['first_2day'].notna() & df['pre_event_vol'].notna() & (df['pre_event_vol'] > 0)].copy()
+
+    df['hist_pre_vol_median'] = df.groupby('ticker')['pre_event_vol'].transform(
+        lambda x: x.shift(1).expanding(min_periods=1).median()
+    )
+    
+    df['hist_event_count'] = df.groupby('ticker')['pre_event_vol'].transform(
+        lambda x: x.shift(1).expanding(min_periods=1).count()
+    )
+
+    df['norm_pre_vol'] = df['pre_event_vol'] / (df['hist_pre_vol_median'] + 1e-6)
+    df['spike_score'] = df['first_2day'] / (df['pre_event_vol'] + 1e-6)
+
+    df['buy_signal'] = np.where(
+        (df['hist_event_count'] >= min_history_events) &
+        (df['norm_pre_vol'] <= low_vol_threshold) &
+        (df['first_2day'] > 0) &
+        (df['spike_score'] >= spike_threshold),
+        1,
+        0
+    )
+
+    df['vol_lookback_days'] = vol_lookback_days
+    df['low_vol_threshold'] = low_vol_threshold
+    df['spike_threshold'] = spike_threshold
+
+    df = add_next_trading_day(df, price_data, event_date_col='earn_date', trade_delay=2)
+
+    merged = price_data.copy()
+    merged['date'] = pd.to_datetime(merged['date'])
+
+    signals_only = df[df['buy_signal'] == 1][['ticker', 'buy_date', 'buy_signal']]
+
+    merged = merged.merge(
+        signals_only,
+        left_on=['ticker', 'date'],
+        right_on=['ticker', 'buy_date'],
+        how='left'
+    )
+
+    merged['buy_signal'] = merged['buy_signal'].fillna(0).astype(int)
+    merged = merged.drop(columns=['buy_date'], errors='ignore')
+    merged = merged.sort_values(['date', 'ticker']).reset_index(drop=True)
+
+    print(f"Done! Generated {merged['buy_signal'].sum()} buy signals.")
+    return merged, df
+
+
+def analyze_strategy_vs_spy(daily_portfolio, spy_close, log_scale=False, risk_free_rate=0.0):
+    daily_portfolio = daily_portfolio.copy()
+    spy_close = spy_close.copy()
+
+    daily_portfolio['date'] = pd.to_datetime(daily_portfolio['date'])
+    spy_close['date'] = pd.to_datetime(spy_close['Date'])
+
+    first_active_idx = daily_portfolio[daily_portfolio['num_positions'] > 0].index[0]
+    start_idx = max(first_active_idx - 1, 0)
+    start_date = daily_portfolio['date'].iloc[start_idx]
+    end_date = daily_portfolio['date'].iloc[-1]
+
+    spy_filtered = spy_close[(spy_close['date'] >= start_date) & (spy_close['date'] <= end_date)].copy()
+    spy_filtered['spy_equity'] = spy_filtered['Close'] / spy_filtered['Close'].iloc[0]
+
+    merged_df = daily_portfolio.merge(
+        spy_filtered[['date', 'spy_equity']],
+        on='date',
+        how='left'
+    )
+
+    def compute_metrics(equity_series):
+        total_return = equity_series.iloc[-1] / equity_series.iloc[0] - 1
+        n_years = (merged_df['date'].iloc[-1] - merged_df['date'].iloc[0]).days / 365.25
+        cagr = (equity_series.iloc[-1] / equity_series.iloc[0]) ** (1 / n_years) - 1
+        running_max = equity_series.cummax()
+        drawdowns = (equity_series - running_max) / running_max
+        max_drawdown = drawdowns.min()
+
+        daily_returns = equity_series.pct_change().dropna()
+        volatility = daily_returns.std() * np.sqrt(252)
+        sharpe = (daily_returns.mean() * 252 - risk_free_rate) / volatility if volatility != 0 else np.nan
+        calmar = cagr / abs(max_drawdown) if max_drawdown != 0 else np.nan
+
+        return {
+            'total_return': total_return,
+            'CAGR': cagr,
+            'max_drawdown': max_drawdown,
+            'volatility': volatility,
+            'sharpe_ratio': sharpe,
+            'calmar_ratio': calmar
+        }
+
+    metrics = {
+        'strategy': compute_metrics(merged_df['portfolio_value'].iloc[start_idx:]),
+        'SPY': compute_metrics(merged_df['spy_equity'].iloc[start_idx:])
+    }
+
+    strategy_label = (
+        f"Strategy\n"
+        f"Total: {metrics['strategy']['total_return']:.2f}, "
+        f"CAGR: {metrics['strategy']['CAGR']:.2f}, "
+        f"MaxDD: {metrics['strategy']['max_drawdown']:.2f}, "
+        f"Sharpe: {metrics['strategy']['sharpe_ratio']:.2f}"
+    )
+
+    spy_label = (
+        f"SPY\n"
+        f"Total: {metrics['SPY']['total_return']:.2f}, "
+        f"CAGR: {metrics['SPY']['CAGR']:.2f}, "
+        f"MaxDD: {metrics['SPY']['max_drawdown']:.2f}, "
+        f"Sharpe: {metrics['SPY']['sharpe_ratio']:.2f}"
+    )
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(
+        merged_df['date'].iloc[start_idx:],
+        merged_df['portfolio_value'].iloc[start_idx:] / merged_df['portfolio_value'].iloc[start_idx],
+        label=strategy_label,
+        color='blue'
+    )
+    plt.plot(
+        merged_df['date'].iloc[start_idx:],
+        merged_df['spy_equity'].iloc[start_idx:],
+        label=spy_label,
+        color='orange',
+        linestyle='--'
+    )
+    plt.xlabel('Date')
+    plt.ylabel('Cumulative Equity')
+    plt.title('Strategy vs SPY')
+    plt.legend(loc='upper left', fontsize=10)
+    plt.grid(True)
+    if log_scale:
+        plt.yscale('log')
+    plt.show()
+
+    return merged_df, metrics
+
+
+def plot_cash_fraction(merged_df, trim_start=0, trim_end=0, plot=True):
+    merged_df = merged_df.copy()
+    merged_df['cash_fraction'] = merged_df['cash'] / merged_df['portfolio_value']
+
+    if trim_start > 0 or trim_end > 0:
+        trimmed_df = merged_df.iloc[trim_start: len(merged_df) - trim_end]
+    else:
+        trimmed_df = merged_df
+
+    if plot:
+        plt.figure(figsize=(12, 6))
+        plt.plot(trimmed_df['date'], trimmed_df['cash_fraction'], label='Cash Fraction', color='green')
+        plt.xlabel('Date')
+        plt.ylabel('Fraction of Portfolio in Cash')
+        plt.title('Portfolio Cash Fraction (Trimmed Start/End)')
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+    auc_cash = np.trapz(merged_df['cash_fraction'], dx=1)
+    avg_cash_fraction = auc_cash / len(merged_df)
+
+    return auc_cash, avg_cash_fraction, trimmed_df
+
+
+def backtest_cash_trading(
+    merged,
+    max_positions=5,
+    hold_days=30,
+    initial_cash=5000.0
+):
+    merged = merged.sort_values(['date', 'ticker']).reset_index(drop=True)
+    dates = merged['date'].drop_duplicates().sort_values().to_numpy()
+
+    portfolio = {}
+    cash = float(initial_cash)
+
+    daily_values = []
+    trades = []
+
+    for date in dates:
+        today_data = merged[merged['date'] == date].set_index('ticker')
+
+        market_value = 0.0
+        for t, pos in portfolio.items():
+            if t in today_data.index:
+                mv = pos['shares'] * today_data.loc[t, 'close']
+                price = today_data.loc[t, 'close']
+                portfolio[t]['last_price'] = price
+            else:
+                mv = pos['shares'] * pos['buy_price']
+            market_value += mv
+
+        portfolio_value = cash + market_value
+
+        daily_values.append({
+            'date': date,
+            'cash': cash,
+            'market_value': market_value,
+            'portfolio_value': portfolio_value,
+            'num_positions': len(portfolio)
+        })
+
+        to_delete = []
+
+        for t, pos in portfolio.items():
+            if t in today_data.index:
+                continue
+            else:
+                future_prices = merged[(merged['ticker'] == t) & (merged['date'] > date)]
+                if future_prices.empty:
+                    price = pos['last_price']
+                    cash_before = cash
+                    notional = pos['shares'] * price
+                    cash += notional
+
+                    trades.append({
+                        'date': date,
+                        'ticker': t,
+                        'action': 'SELL',
+                        'shares': pos['shares'],
+                        'price': price,
+                        'notional': notional,
+                        'cash_before': cash_before,
+                        'cash_after': cash,
+                        'reason': 'auto_sell_no_future_price'
+                    })
+
+                    to_delete.append(t)
+
+        for t in to_delete:
+            del portfolio[t]
+
+        eligible = {}
+        for t, pos in portfolio.items():
+            held_days = (pd.Timestamp(date) - pd.Timestamp(pos['buy_date'])).days
+            eligible[t] = held_days >= hold_days
+
+        signals = today_data[today_data['buy_signal'] == 1]
+
+        for ticker, row in signals.sort_index().iterrows():
+            price = row['close']
+
+            if ticker in portfolio:
+                continue
+
+            if len(portfolio) >= max_positions:
+                eligible_tickers = [t for t, ok in eligible.items() if ok]
+
+                if eligible_tickers:
+                    oldest = min(eligible_tickers, key=lambda t: portfolio[t]['buy_date'])
+
+                    sell_price = today_data.loc[oldest, 'close']
+                    shares = portfolio[oldest]['shares']
+                    notional = shares * sell_price
+
+                    cash_before = cash
+                    cash += notional
+
+                    trades.append({
+                        'date': date,
+                        'ticker': oldest,
+                        'action': 'SELL',
+                        'shares': shares,
+                        'price': sell_price,
+                        'notional': notional,
+                        'cash_before': cash_before,
+                        'cash_after': cash,
+                        'reason': 'sell_to_free_slot'
+                    })
+
+                    del portfolio[oldest]
+                    del eligible[oldest]
+                else:
+                    continue
+
+            market_value_after = 0.0
+            for t, pos in portfolio.items():
+                if t in today_data.index:
+                    market_value_after += pos['shares'] * today_data.loc[t, 'close']
+                else:
+                    market_value_after += pos['shares'] * pos['buy_price']
+
+            portfolio_value_after = cash + market_value_after
+            target_dollars = portfolio_value_after / max_positions
+            dollars_to_invest = min(target_dollars, cash)
+
+            if dollars_to_invest <= 0:
+                continue
+
+            shares = dollars_to_invest / price
+            notional = shares * price
+
+            cash_before = cash
+            cash -= notional
+
+            portfolio[ticker] = {
+                'shares': shares,
+                'buy_date': date,
+                'buy_price': price,
+                'last_price': price
+            }
+
+            trades.append({
+                'date': date,
+                'ticker': ticker,
+                'action': 'BUY',
+                'shares': shares,
+                'price': price,
+                'notional': notional,
+                'cash_before': cash_before,
+                'cash_after': cash,
+                'reason': 'buy_signal'
+            })
+
+    last_date = dates[-1]
+    last_prices = merged[merged['date'] == last_date].set_index('ticker')
+
+    for t, pos in list(portfolio.items()):
+        if t in last_prices.index:
+            price = last_prices.loc[t, 'close']
+        else:
+            price = pos['buy_price']
+
+        shares = pos['shares']
+        notional = shares * price
+
+        cash_before = cash
+        cash += notional
+
+        trades.append({
+            'date': last_date,
+            'ticker': t,
+            'action': 'SELL',
+            'shares': shares,
+            'price': price,
+            'notional': notional,
+            'cash_before': cash_before,
+            'cash_after': cash,
+            'reason': 'liquidation_end'
+        })
+
+        del portfolio[t]
+
+    daily_values.append({
+        'date': last_date,
+        'cash': cash,
+        'market_value': 0.0,
+        'portfolio_value': cash,
+        'num_positions': 0
+    })
+
+    return pd.DataFrame(daily_values), pd.DataFrame(trades)
+
+
+def analyze_trades(trades_df):
+    trades = trades_df.copy()
+    trades['date'] = pd.to_datetime(trades['date'])
+    trades['action'] = trades['action'].str.upper()
+
+    buys = trades[trades['action'] == 'BUY']
+    sells = trades[trades['action'] == 'SELL']
+    holding_times = []
+
+    for ticker in buys['ticker'].unique():
+        buy_rows = buys[buys['ticker'] == ticker].sort_values('date')
+        sell_rows = sells[sells['ticker'] == ticker].sort_values('date')
+        sell_list = sell_rows.to_dict('records')
+
+        for _, buy in buy_rows.iterrows():
+            sell_idx = next((i for i, s in enumerate(sell_list) if s['date'] > buy['date']), None)
+            if sell_idx is not None:
+                sell = sell_list.pop(sell_idx)
+                holding_days = (sell['date'] - buy['date']).days
+                pnl = (sell['price'] - buy['price']) * buy['shares']
+                return_pct = pnl / (buy['price'] * buy['shares'])
+
+                holding_times.append({
+                    'ticker': ticker,
+                    'buy_date': buy['date'],
+                    'sell_date': sell['date'],
+                    'holding_days': holding_days,
+                    'cash_used': buy['cash_before'] - buy['cash_after'],
+                    'pnl': pnl,
+                    'return_pct': return_pct
+                })
+
+    holding_df = pd.DataFrame(holding_times)
+    summary = {}
+
+    if not holding_df.empty:
+        summary['average_holding_days'] = holding_df['holding_days'].mean()
+        summary['median_holding_days'] = holding_df['holding_days'].median()
+        summary['max_holding_days'] = holding_df['holding_days'].max()
+        summary['min_holding_days'] = holding_df['holding_days'].min()
+        summary['total_trades'] = len(holding_df)
+        summary['unique_tickers_traded'] = holding_df['ticker'].nunique()
+
+        summary['total_buys'] = len(buys)
+        summary['total_sells'] = len(sells)
+        summary['buy_ratio'] = len(buys) / (len(buys) + len(sells))
+        summary['sell_ratio'] = len(sells) / (len(buys) + len(sells))
+
+        summary['avg_cash_used'] = holding_df['cash_used'].mean()
+        summary['max_cash_used'] = holding_df['cash_used'].max()
+        summary['min_cash_used'] = holding_df['cash_used'].min()
+
+        wins = holding_df[holding_df['pnl'] > 0]
+        losses = holding_df[holding_df['pnl'] <= 0]
+        summary['win_rate'] = len(wins) / len(holding_df)
+        summary['avg_win'] = wins['pnl'].mean() if not wins.empty else 0
+        summary['avg_loss'] = losses['pnl'].mean() if not losses.empty else 0
+        summary['largest_win'] = wins['pnl'].max() if not wins.empty else 0
+        summary['largest_loss'] = losses['pnl'].min() if not losses.empty else 0
+
+        trade_counts = holding_df['ticker'].value_counts()
+        summary['top_5_tickers_by_trades'] = trade_counts.head(5).to_dict()
+
+        pnl_by_ticker = holding_df.groupby('ticker')['pnl'].sum().sort_values(ascending=False)
+        summary['top_5_tickers_by_pnl'] = pnl_by_ticker.head(5).to_dict()
+    else:
+        summary = {
+            'average_holding_days': None,
+            'median_holding_days': None,
+            'max_holding_days': None,
+            'min_holding_days': None,
+            'total_trades': 0,
+            'unique_tickers_traded': 0,
+            'total_buys': 0,
+            'total_sells': 0,
+            'buy_ratio': None,
+            'sell_ratio': None,
+            'avg_cash_used': None,
+            'max_cash_used': None,
+            'min_cash_used': None,
+            'win_rate': None,
+            'avg_win': None,
+            'avg_loss': None,
+            'largest_win': None,
+            'largest_loss': None,
+            'top_5_tickers_by_trades': None,
+            'top_5_tickers_by_pnl': None
+        }
+
+    return summary, holding_df
+
+
+# Signal parameters
+vol_lookback_days = 60      # x days before earnings to estimate volatility
+low_vol_threshold = 0.80    # "quiet before earnings" filter
+spike_threshold = 2.00      # event spike must be large relative to prior vol
+min_history_events = 8      # avoid unstable normalization early in each ticker history
+
+# Backtest parameters
+init_cash = 1
+max_pos = 10
+hold_days = 42
+
+# Step 1: create longer earnings windows
+earnings_windows = create_earnings_windows(
+    price_data=price_data,
+    earnings_data=earnings_data,
+    tickers=tickers,
+    window_days=30,
+    pre_event_days=vol_lookback_days
+)
+
+# Step 2: compute event-level results, now including pre-event volatility
+all_results = group_results(
+    earnings_windows=earnings_windows,
+    tickers=tickers,
+    spy_close=spy_close,
+    lookback_vol_days=vol_lookback_days
+)
+
+# Step 3: export event table with all signal features
+signal_features = extract_signal_features_df(all_results)
+signal_features.to_csv("signal_features_quiet_spike.csv", index=False)
+
+# Optional: a fuller analysis table including weekly ARs
+flat_results_full = flatten_all_results(all_results, max_weeks=6)
+flat_results_full.to_csv("flattened_results_quiet_spike.csv", index=False)
+
+# Step 4: generate the new buy signal and merge it into prices
+merged, signal_events = add_quiet_spike_buy_signals_to_prices(
+    price_data=price_data,
+    flat_results=signal_features,
+    vol_lookback_days=vol_lookback_days,
+    low_vol_threshold=low_vol_threshold,
+    spike_threshold=spike_threshold,
+    min_history_events=min_history_events
+)
+
+signal_events.to_csv("signal_events_with_flags.csv", index=False)
+
+# Step 5: run the unchanged backtest engine with the new signal
+cash_portfolio, trades = backtest_cash_trading(
+    merged,
+    max_positions=max_pos,
+    hold_days=hold_days,
+    initial_cash=init_cash
+)
+
+merged_df, metrics = analyze_strategy_vs_spy(
+    cash_portfolio,
+    spy_close,
+    log_scale=False,
+    risk_free_rate=0.042
+)
+
+print(metrics)
+
+trades_summary, holding_df = analyze_trades(trades)
+print(trades_summary)
+
+trades.to_csv("trades_quiet_spike.csv", index=False)
+cash_portfolio.to_csv("cash_portfolio_quiet_spike.csv", index=False)
+holding_df.to_csv("holding_periods_quiet_spike.csv", index=False)
